@@ -1,5 +1,6 @@
 """
-DumbSolo: a simplified, cross-platform SoloLite-style harvester for IGU-16HR & BD3C-5 seismic nodes
+dumbsolo.py - DumbSolo: a simplified, cross-platform SoloLite-style harvester
+for IGU-16HR & BD3C-5 seismic nodes.
 
 Version 0.1 ~ Oct 12 2026
 
@@ -1090,7 +1091,7 @@ MSEED_RECORD_LENGTH = 4096
 #  "Wipe" deletes EVERYTHING on a node (all files and sub-folders) except the
 #  files named here (case-insensitive, in the node's top folder). Folders the
 #  operating system manages on the volume (ARCHIVE_SKIP) are also left alone.
-WIPE_KEEP = ("device.ini",)
+WIPE_KEEP = ("device.ini", "sct_par.xml")
 
 #  Data file formats. A node may hold MiniSEED (seisNNN?.MiniSeed) and/or the
 #  vendor DLD format (seisNNN?.DLD); both are read automatically. If the same
@@ -2071,6 +2072,189 @@ def wipe_node(node: Node, log: Callable[[str], None] = print) -> Tuple[int, int]
 
 
 # --------------------------------------------------------------------------- #
+# Programming (copying a settings file to nodes as sct_par.xml)
+# --------------------------------------------------------------------------- #
+
+SCT_ROOT_TAG = "script_Information"
+SCT_MAX_BYTES = 64 * 1024
+#  Tags a settings file must contain (plus Channel_n_type / Channel_n_Gain for
+#  every channel n = 1 .. ChNumber).
+SCT_REQUIRED = ("script_file_name", "device_type", "ChNumber", "Sample_Rate",
+                "begin_Day", "begin_time", "end_time")
+
+
+def validate_sct_par(path: str) -> dict:
+    """Check a settings file before it is copied to nodes.
+    Returns dict(raw=bytes, params={tag: text}, errors=[...], warnings=[...]);
+    the file must not be used if errors is non-empty."""
+    out = dict(raw=b"", params={}, errors=[], warnings=[])
+    err, warn = out["errors"], out["warnings"]
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        err.append(f"cannot read file: {e}")
+        return out
+    if size == 0:
+        err.append("file is empty")
+        return out
+    if size > SCT_MAX_BYTES:
+        err.append(f"file is {size} bytes - too large for a settings file")
+        return out
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    out["raw"] = raw
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        err.append("not a text file (not valid UTF-8 / ASCII)")
+        return out
+    if any(ord(c) > 127 for c in text):
+        warn.append("contains non-ASCII characters")
+    try:
+        root = ET.fromstring(text.strip())
+    except ET.ParseError as e:
+        err.append(f"not well-formed XML: {e}")
+        return out
+    if root.tag != SCT_ROOT_TAG:
+        err.append(f"root element is <{root.tag}>, expected <{SCT_ROOT_TAG}>")
+        return out
+    params, seen = {}, set()
+    for child in root:
+        if len(child):
+            err.append(f"<{child.tag}> contains nested elements")
+        if child.tag in seen:
+            err.append(f"<{child.tag}> appears more than once")
+        seen.add(child.tag)
+        params[child.tag] = (child.text or "").strip()
+    out["params"] = params
+    for tag in SCT_REQUIRED:
+        if not params.get(tag):
+            err.append(f"<{tag}> missing or empty")
+    if err:
+        return out
+
+    def as_int(tag, lo=None, hi=None):
+        try:
+            v = int(params[tag])
+        except (KeyError, ValueError):
+            err.append(f"<{tag}> is not a whole number: {params.get(tag)!r}")
+            return None
+        if (lo is not None and v < lo) or (hi is not None and v > hi):
+            err.append(f"<{tag}> = {v} is outside {lo}..{hi}")
+            return None
+        return v
+
+    nch = as_int("ChNumber", 1, 4)
+    m = re.search(r"(\d)C\b", params["device_type"], re.IGNORECASE)
+    if nch and m and int(m.group(1)) != nch:
+        err.append(f"<ChNumber> = {nch} but device type '{params['device_type']}' "
+                   f"has {m.group(1)} channel(s)")
+    for n in range(1, (nch or 0) + 1):
+        for tag in (f"Channel_{n}_type", f"Channel_{n}_Gain"):
+            if not params.get(tag):
+                err.append(f"<{tag}> missing (ChNumber = {nch})")
+        if params.get(f"Channel_{n}_Gain"):
+            g = as_int(f"Channel_{n}_Gain", 0, 36)
+            if g is not None and g % 6:
+                warn.append(f"Channel_{n}_Gain = {g} dB is not one of 0, 6, ..., 36")
+    gains = {params[f"Channel_{n}_Gain"] for n in range(1, (nch or 0) + 1)
+             if params.get(f"Channel_{n}_Gain")}
+    if len(gains) > 1:
+        warn.append("channel gains differ - DumbSolo will refuse to harvest such nodes")
+    sr = as_int("Sample_Rate", 1)
+    if sr:
+        hz = 1e5 / sr
+        if hz not in (50, 100, 125, 200, 250, 500, 1000, 2000, 4000):
+            warn.append(f"Sample_Rate {sr} = {hz:g} Hz is unusual")
+    if params.get("MiniSeed_Output_Mode", "") not in ("0", "1"):
+        warn.append("output format unclear: MiniSeed_Output_Mode is "
+                    f"{params.get('MiniSeed_Output_Mode') or 'missing'} (expected 0 = DLD or 1 = MiniSEED)")
+    try:
+        dt.datetime.strptime(params["begin_Day"], "%Y/%m/%d")
+    except ValueError:
+        err.append(f"<begin_Day> '{params['begin_Day']}' is not YYYY/MM/DD")
+    for tag in ("begin_time", "end_time"):
+        try:
+            dt.datetime.strptime(params[tag], "%H,%M,%S")
+        except ValueError:
+            err.append(f"<{tag}> '{params[tag]}' is not HH,MM,SS")
+    return out
+
+
+def sct_mismatch(info: dict, node: Node) -> str:
+    """Why this settings file must NOT go on this node ('' if it may)."""
+    want = info["params"].get("device_type", "").strip()
+    have = (node.device_type or "").strip()
+    if not have:
+        return ("node's device type is unknown (no sct_par.xml / log on it), so the "
+                "file can't be checked against it")
+    if have != want:
+        return f"node is '{have}', file is for '{want}'"
+    return ""
+
+
+def sct_output_format(p: dict) -> str:
+    """Recording format from <MiniSeed_Output_Mode>: 1 = MiniSEED, 0 = DLD."""
+    mode = p.get("MiniSeed_Output_Mode")
+    if mode is None or mode == "":
+        return "not set in file (MiniSeed_Output_Mode missing)"
+    if mode == "1":
+        rl = p.get("MiniSeed_Record_Length512")
+        rec = (", 512-byte records" if rl == "1" else
+               f", record length tag MiniSeed_Record_Length512={rl}" if rl not in (None, "") else "")
+        return f"MiniSEED{rec} (MiniSeed_Output_Mode=1)"
+    if mode == "0":
+        return "DLD (MiniSeed_Output_Mode=0)"
+    return f"UNKNOWN (MiniSeed_Output_Mode={mode})"
+
+
+def sct_summary(info: dict) -> str:
+    p = info["params"]
+    try:
+        hz = f"{1e5 / int(p['Sample_Rate']):g} Hz"
+    except (KeyError, ValueError, ZeroDivisionError):
+        hz = "?"
+    try:
+        nch = int(p.get("ChNumber", 0))
+    except ValueError:
+        nch = 0
+    gains = ", ".join(p.get(f"Channel_{n}_Gain", "?") for n in range(1, nch + 1))
+    return "\n".join([
+        f"  Script:         {p.get('script_file_name', '?')}",
+        f"  Device type:    {p.get('device_type', '?')}",
+        f"  Output format:  {sct_output_format(p)}",
+        f"  Channels:       {nch}, gain {gains} dB",
+        f"  Sample rate:    {hz} (Sample_Rate={p.get('Sample_Rate', '?')})",
+        f"  Start:          {p.get('begin_Day', '?')} {p.get('begin_time', '?').replace(',', ':')}",
+    ])
+
+
+def program_node(node: Node, raw: bytes, backup_dir: str = "") -> str:
+    """Write raw (byte for byte) to the node as sct_par.xml and read it back.
+    The previous file is copied to backup_dir first, if given. Returns the
+    path written."""
+    if not node_present(node.path):
+        raise NotMounted(f"{node.serial}: {node.path} is not mounted / no longer exists")
+    dest = _ci_path(node.path, "sct_par.xml") or os.path.join(node.path, "sct_par.xml")
+    if backup_dir and os.path.isfile(dest):
+        os.makedirs(backup_dir, exist_ok=True)
+        stamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+        with open(dest, "rb") as a, open(os.path.join(
+                backup_dir, f"{node.serial}_{stamp}_sct_par.xml"), "wb") as b:
+            b.write(a.read())
+    tmp = os.path.join(node.path, "sct_par.xml.part")
+    with open(tmp, "wb") as fh:
+        fh.write(raw)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, dest)
+    with open(dest, "rb") as fh:
+        if fh.read() != raw:
+            raise OSError(f"{node.serial}: read-back of {dest} does not match")
+    return dest
+
+
+# --------------------------------------------------------------------------- #
 # High-level harvest used by CLI and GUI
 # --------------------------------------------------------------------------- #
 
@@ -2747,6 +2931,9 @@ class MainWindow(QMainWindow):
              "snap to real data gaps"),
             ("Map", self.show_map, "Plot station positions (harvest DB + loaded deployments)"),
             ("Export node table...", self.export_table, "Save the node table as CSV"),
+            ("Program checked nodes...", self.program_nodes,
+             "Copy a settings file to the checked node volumes as sct_par.xml "
+             "(checked against each node's device type)"),
             ("Wipe checked nodes...", self.wipe_nodes,
              "Delete data/log files from the checked node volumes"),
         ]:
@@ -3737,6 +3924,77 @@ class MainWindow(QMainWindow):
         finally:
             QGuiApplication.restoreOverrideCursor()
 
+    # ---------------- program ----------------
+    def program_nodes(self):
+        if self._busy():
+            QMessageBox.information(self, "Busy", "Wait for the running task to finish."); return
+        self.check_present()
+        nodes = self.checked_bases()
+        skip = [n for n in nodes if getattr(n, "_archive", "") or not getattr(n, "_volume", False)]
+        nodes = [n for n in nodes if n not in skip]
+        for n in skip:
+            self.log(f"Program: {n.serial} is not a mounted USB node (folder/archive) - skipped")
+        if not nodes:
+            QMessageBox.information(self, "Program", "No USB node volumes checked."); return
+        start = self.cfg.value("sct_dir", self.project.folder if self.project else "")
+        path, _ = QFileDialog.getOpenFileName(self, "Settings file to program (becomes sct_par.xml)",
+                                              start, "Settings (*.xml);;All files (*)")
+        if not path:
+            return
+        self.cfg.setValue("sct_dir", os.path.dirname(path))
+        info = validate_sct_par(path)
+        if info["errors"]:
+            QMessageBox.critical(self, "Program - file rejected",
+                                 f"{os.path.basename(path)} can't be used:\n\n" +
+                                 "\n".join(f"  - {e}" for e in info["errors"]))
+            self.log(f"Program: {path} rejected: " + "; ".join(info["errors"]))
+            return
+        ok = [n for n in nodes if not sct_mismatch(info, n)]
+        bad = [(n, sct_mismatch(info, n)) for n in nodes if sct_mismatch(info, n)]
+        unknown = [n for n, _ in bad if not (n.device_type or "").strip()]
+        wrong = [(n, why) for n, why in bad if n not in unknown]
+        has_data = [n for n in ok if n.files]
+        text = (f"File: {path}\n\n{sct_summary(info)}\n")
+        if info["warnings"]:
+            text += "\nWarnings:\n" + "\n".join(f"  - {w}" for w in info["warnings"]) + "\n"
+        if wrong:
+            text += (f"\nWrong device type - will NOT be programmed ({len(wrong)}):\n" +
+                     "\n".join(f"  {n.serial}: {why}" for n, why in wrong) + "\n")
+        if unknown:
+            text += (f"\nNo existing sct_par.xml or log, so the device type can't be "
+                     f"checked ({len(unknown)}):\n" +
+                     "\n".join(f"  {n.serial}" for n in unknown) +
+                     "\nYou will have to program these nodes via SoloLite or manually "
+                     "copy the parameters XML yourself.\n")
+        if not ok:
+            QMessageBox.warning(self, "Program", text)
+            for n, why in bad:
+                self.log(f"Program: {n.serial} refused - {why}")
+            return
+        text += (f"\nWrite it as sct_par.xml to {len(ok)} node(s):\n" +
+                 "\n".join(f"  {n.serial}" for n in ok) + "\n")
+        if has_data:
+            text += (f"\nNote: {len(has_data)} of these still hold recorded data "
+                     f"(programming doesn't delete it).\n")
+        if QMessageBox.question(self, "Program nodes", text + "\nContinue?",
+                                QMessageBox.Yes | QMessageBox.Cancel,
+                                QMessageBox.Cancel) != QMessageBox.Yes:
+            return
+        for n, why in bad:
+            self.log(f"Program: {n.serial} refused - {why}")
+        backup = self.project.abspath("sct_par_backups") if self.project else ""
+        for n in ok:
+            try:
+                dest = program_node(n, info["raw"], backup)
+                self.log(f"Programmed {n.serial}: {os.path.basename(path)} -> {dest}")
+                self._reload_base(n.path, status="programmed")
+            except NotMounted as e:
+                self.log(f"Program: {e}")
+                self._remove_base(n.path, "no longer mounted")
+            except Exception as e:  # noqa
+                self.log(f"Program: {n.serial} FAILED: {e}")
+                self._set_status_path(n.path, "program failed")
+
     # ---------------- wipe ----------------
     def wipe_nodes(self):
         if self._busy():
@@ -3820,6 +4078,7 @@ class MainWindow(QMainWindow):
             for k in ("latitude", "longitude", "elevation", "n_fixes"):
                 setattr(node, k, getattr(old, k))
         node._archive = getattr(old, "_archive", "")
+        node._volume = getattr(old, "_volume", False)     # still the same USB volume
         self.bases[path] = node
         for key in [k for k in self.rows if k.startswith(path + "#")]:
             self._status[key] = status
