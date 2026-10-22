@@ -1,4 +1,4 @@
-# DumbSolo
+# DumbSolo v0.1.0
 
 DumbSolo is a single-file, cross-platform (Win,OSX,Linux) desktop GUI utility for collecting data
 from DigiS0lo-style seismic nodes (IGU-16HR 3C, IGU-16 1C and BD3C-5 types).
@@ -18,6 +18,8 @@ What it WON'T and will never do:
 - update/program firmware
 - create new settings files (will have to manually edit pre-existing)
 - any of the other more engineering-based stuff Sol0Lite does
+
+DLD engineering guided by: https://github.com/TobbeTripitaka/node_toolbox
 
 Most of this code and README is originally AI (sorry!!) but we have tested it fairly extensively in our lab.
 It should be working more or less as expected, but bug reports and PRs gladly received.
