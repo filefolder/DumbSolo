@@ -2,7 +2,7 @@
 dumbsolo.py - DumbSolo: a simplified, cross-platform SoloLite-style harvester
 for IGU-16HR & BD3C-5 seismic nodes.
 
-Version 0.1 ~ Oct 12 2026
+Version 0.1 ~ Oct 22 2026
 
     pip install PySide6 obspy
     python dumbsolo.py
@@ -1853,7 +1853,7 @@ def _paz_adc_response(sample_rate: float, *, zeros, poles, norm_factor: float,
 
 def _resp_igu16_1c_5hz(sample_rate: float):
     """IGU-16 1C, 5 Hz geophone, 76.6 V/(m/s), ADC 3355500 counts/V.
-    Values as for the IGU-16HR 3C 5Hz; the 1C reports device_type
+    Values as for the IGU-16HR 3C 5Hz; the units sometime reports device_type
     'IGU-16 1C 5Hz' (no 'HR')."""
     from obspy.core.inventory import Equipment
     resp = _paz_adc_response(
@@ -1925,7 +1925,9 @@ class SensorType:
 #      "...": SensorType("H", 120.0, _resp_...)  -> CHZ at 250 Hz, HHZ at 100 Hz
 SENSOR_TYPES: Dict[str, SensorType] = {
     "IGU-16 1C 5Hz": SensorType("P", 0.2, _resp_igu16_1c_5hz),
+    "IGU-1C 5Hz": SensorType("P", 0.2, _resp_igu16_1c_5hz), # haven't seen this but it may be possible
     "IGU-16HR 3C 5Hz": SensorType("P", 0.2, _resp_igu16hr_3c_5hz),
+    "IGU-3C 5Hz": SensorType("P", 0.2, _resp_igu16hr_3c_5hz), # this seems to show up sometimes?
     "IGU-16 BD3C 5s": SensorType("H", 5.0, _resp_igu16_bd3c_5s),
 }
 
@@ -2575,7 +2577,7 @@ class Project:
     network: str = "XX"
     location: str = ""
     sds: str = "sds"
-    xml: str = "inventory.xml"
+    xml: str = ""                   # "" = inventory.xml next to the SDS folder
     raw: str = "raw_data"
     extracted: str = "raw_data/extracted"
     gap_hours: float = 1.0          # split deployments at data gaps longer than this
@@ -3014,19 +3016,23 @@ class MainWindow(QMainWindow):
         self.ed_sds = QLineEdit(placeholderText="SDS root folder")
         b = QPushButton("...", maximumWidth=30); b.clicked.connect(self._pick_sds)
         h = QHBoxLayout(); h.addWidget(self.ed_sds); h.addWidget(b); v.addLayout(h)
-        self.ed_xml = QLineEdit(placeholderText="inventory.xml")
+        self.ed_xml = QLineEdit(placeholderText="inventory.xml next to the SDS folder")
         b = QPushButton("...", maximumWidth=30); b.clicked.connect(self._pick_xml)
         h = QHBoxLayout(); h.addWidget(self.ed_xml); h.addWidget(b); v.addLayout(h)
         self.ed_raw = QLineEdit(placeholderText="raw data (archives) folder")
         b = QPushButton("...", maximumWidth=30); b.clicked.connect(self._pick_raw)
         h = QHBoxLayout(); h.addWidget(self.ed_raw); h.addWidget(b); v.addLayout(h)
         for w, tip in ((self.ed_sds, "SDS archive root (also holds the harvest DB)"),
-                       (self.ed_xml, "StationXML output file"),
+                       (self.ed_xml, "StationXML output file. Leave blank to write\n"
+                                     "inventory.xml next to the SDS folder (in the folder\n"
+                                     "that contains it)."),
                        (self.ed_raw, "Folder for raw node backups (.tar.gz)")):
             w.setToolTip(tip)
             w.editingFinished.connect(self._save_project)
         for w in (self.ed_net, self.ed_loc):
             w.editingFinished.connect(self._save_project)
+        self.ed_sds.textChanged.connect(self._update_xml_placeholder)
+        self.ed_xml.textChanged.connect(self._update_xml_placeholder)
         self.chk_sds = QCheckBox("Harvest to SDS", checked=True)
         self.chk_xml = QCheckBox("Write StationXML", checked=True)
         self.cb_xml_scope = QComboBox()
@@ -3189,7 +3195,8 @@ class MainWindow(QMainWindow):
         self._save_project()
         self.project = pr
         for w, v in ((self.ed_net, pr.network), (self.ed_loc, pr.location),
-                     (self.ed_sds, pr.abspath(pr.sds)), (self.ed_xml, pr.abspath(pr.xml)),
+                     (self.ed_sds, pr.abspath(pr.sds)),
+                     (self.ed_xml, "" if pr.xml in ("", "inventory.xml") else pr.abspath(pr.xml)),
                      (self.ed_raw, pr.abspath(pr.raw))):
             w.setText(v)
         self.sp_gap.setValue(float(pr.gap_hours))
@@ -3416,10 +3423,29 @@ class MainWindow(QMainWindow):
         if d:
             self.ed_raw.setText(d); self._save_project()
 
+    def default_xml_path(self) -> str:
+        """inventory.xml next to the SDS folder (in its parent folder)."""
+        root = self.ed_sds.text().strip()
+        if not root:
+            return ""
+        return os.path.join(os.path.dirname(os.path.normpath(os.path.abspath(root))),
+                            "inventory.xml")
+
+    def xml_path(self) -> str:
+        """StationXML file: the path entered, else the default next to SDS."""
+        return self.ed_xml.text().strip() or self.default_xml_path()
+
+    def _update_xml_placeholder(self, *_):
+        d = self.xml_path() if not self.ed_xml.text().strip() else ""
+        self.ed_xml.setPlaceholderText(d or "inventory.xml next to the SDS folder")
+
     def _pick_xml(self):
-        p, _ = QFileDialog.getSaveFileName(self, "StationXML", self.ed_xml.text() or "inventory.xml",
+        p, _ = QFileDialog.getSaveFileName(self, "StationXML", self.xml_path() or "inventory.xml",
                                            "StationXML (*.xml)")
         if p:
+            if self.default_xml_path() and \
+                    os.path.normpath(p) == os.path.normpath(self.default_xml_path()):
+                p = ""                       # the default: keep following the SDS folder
             self.ed_xml.setText(p); self._save_project()
 
     # ---------------- discovery / loading ----------------
@@ -4143,7 +4169,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Nothing to do", "No nodes checked."); return
         root = self.ed_sds.text().strip()
         do_harvest = self.chk_sds.isChecked()
-        xml = self.ed_xml.text().strip() if self.chk_xml.isChecked() else ""
+        xml = self.xml_path() if self.chk_xml.isChecked() else ""
+        if self.chk_xml.isChecked() and not xml:
+            QMessageBox.information(self, "StationXML", "Set the SDS folder (the inventory is "
+                                    "written next to it) or a StationXML file path."); return
         xml_all = self.cb_xml_scope.currentIndex() == 0
         archive = []
         if self.chk_archive.isChecked():
