@@ -2,7 +2,7 @@
 dumbsolo.py - DumbSolo: a simplified, cross-platform SoloLite-style harvester
 for IGU-16HR & BD3C-5 seismic nodes.
 
-Version 0.1 ~ Oct 22 2026
+Version 0.2 ~ Nov 26 2026
 
     pip install PySide6 obspy
     python dumbsolo.py
@@ -36,7 +36,7 @@ such as SCOLV or ML based polarity tools work as expected.
 
 from __future__ import annotations
 
-__version__ = "0.1"
+__version__ = "0.2"
 
 import configparser
 import datetime as dt
@@ -47,19 +47,19 @@ import re
 import statistics
 import struct
 import sys
+import time
 import traceback
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import (Qt, QThread, QTimer, Signal, QStorageInfo, QSettings,
-                            QDateTime, QTimeZone)
+from PySide6.QtCore import (Qt, QThread, QTimer, Signal, QStorageInfo, QSettings)
 from PySide6.QtGui import QAction, QColor, QFont, QFontDatabase
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QGroupBox, QLineEdit, QComboBox, QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QFileDialog, QPlainTextEdit, QProgressBar, QSplitter, QCheckBox,
-    QSpinBox, QMessageBox, QLabel, QAbstractItemView, QToolBar, QDateTimeEdit)
+    QSpinBox, QMessageBox, QLabel, QAbstractItemView, QToolBar)
 
 
 # --------------------------------------------------------------------------- #
@@ -121,6 +121,7 @@ class Node:
     n_fixes_rejected: int = 0         # outliers removed
     n_fixes_outside: int = 0          # logged before/after recording, not used
     pos_scatter_m: Optional[float] = None       # 1-sigma horizontal scatter (used fixes)
+    position_warning: str = ""                  # fixes look like more than one place
     alt_scatter_m: Optional[float] = None
     compass_north: Optional[float] = None   # median eCompass reading
     tilt: Optional[float] = None
@@ -289,16 +290,22 @@ def _robust_keep(vals: List[float], floor: float, k: float) -> List[bool]:
         keep = new
 
 
-def _set_position(node: Node, fixes: list, span=None) -> None:
+def _set_position(node: Node, fixes: list, span=None, strict: bool = False) -> None:
     """Position from GPS fixes (time, lat, lon, alt|None): only fixes logged
-    while the node was recording (span = (start, end); all fixes if none fall
-    inside it), outliers removed, then the mean."""
+    while the node was recording (span = (start, end)), outliers removed, then
+    the mean.
+    strict=False (a whole, unsplit node): if fewer than POSITION_MIN_FIXES fall
+        inside the span (e.g. a very short test file), all fixes are used.
+    strict=True (one deployment of a split node): only fixes inside the span,
+        however few - other fixes belong to other deployments / sites. With none,
+        the position is left empty."""
     node.n_fixes = node.n_fixes_rejected = node.n_fixes_outside = 0
     node.latitude = node.longitude = node.elevation = None
     node.pos_scatter_m = node.alt_scatter_m = None
+    node.position_warning = ""
     if span and span[0] and span[1]:
         inside = [f for f in fixes if f[0] and span[0] <= f[0] <= span[1]]
-        if len(inside) >= min(POSITION_MIN_FIXES, len(fixes)):
+        if strict or len(inside) >= min(POSITION_MIN_FIXES, len(fixes)):
             node.n_fixes_outside = len(fixes) - len(inside)
             fixes = inside
     if not fixes:
@@ -331,6 +338,38 @@ def _set_position(node: Node, fixes: list, span=None) -> None:
                                         statistics.pstdev(f[2] for f in used) * kx)
     if len(ualts) > 1:
         node.alt_scatter_m = statistics.pstdev(ualts)
+    node.position_warning = _position_check(fixes, used, kx, ky)
+
+
+def _position_check(fixes: list, used: list, kx: float, ky: float) -> str:
+    """'' if the fixes look like one place, else a warning."""
+    if len(fixes) < 4:
+        return ""
+    why = []
+    rej = 1 - len(used) / len(fixes)
+    if rej > POSITION_REJECT_WARN:
+        why.append(f"{rej:.0%} of fixes rejected")
+    if node_scatter(used, kx, ky) > POSITION_MOVE_WARN_M:
+        why.append(f"fixes scatter {node_scatter(used, kx, ky):.0f} m")
+    timed = sorted((f for f in fixes if f[0]), key=lambda f: f[0])
+    if len(timed) >= 6:
+        h = len(timed) // 2
+        a, b = timed[:h], timed[h:]
+        dn = (statistics.median(f[1] for f in b) - statistics.median(f[1] for f in a)) * ky
+        de = (statistics.median(f[2] for f in b) - statistics.median(f[2] for f in a)) * kx
+        if math.hypot(dn, de) > POSITION_MOVE_WARN_M:
+            why.append(f"position shifts {math.hypot(dn, de):.0f} m during the recording")
+    if not why:
+        return ""
+    return ("GPS fixes look like more than one place (" + ", ".join(why) +
+            ") - the node may have moved while recording; check the position")
+
+
+def node_scatter(fx: list, kx: float, ky: float) -> float:
+    if len(fx) < 2:
+        return 0.0
+    return math.hypot(statistics.pstdev(f[1] for f in fx) * ky,
+                      statistics.pstdev(f[2] for f in fx) * kx)
 
 
 def read_log(node: Node) -> None:
@@ -830,6 +869,8 @@ def load_node(path: str, gaps: bool = True) -> Node:
         _dld_fixes_fallback(node)
     if node.fixes:
         _set_position(node, node.fixes, (node.start, node.end))
+        if node.position_warning:
+            node.warnings.insert(0, node.position_warning)
     return node
 
 
@@ -857,7 +898,8 @@ def _dld_fixes_fallback(node: Node) -> None:
 def split_deployments(node: Node, gap_hours: float, forced=()) -> List[Node]:
     """Split a node at data gaps longer than gap_hours. Each segment is a
     shallow copy with its own start/end, files and position (GPS fixes inside
-    the segment; all fixes if none). An unsplit node is returned as is."""
+    the segment only - never another deployment's). An unsplit node is
+    returned as is."""
     import copy
     big = sorted({g for g in node.gaps if (g[1] - g[0]).total_seconds() > gap_hours * 3600}
                  | set(forced))
@@ -877,11 +919,14 @@ def split_deployments(node: Node, gap_hours: float, forced=()) -> List[Node]:
         sg.start, sg.end = a, b
         sg.files = [f for f in node.files if f.first_time and f.last_time
                     and f.first_time <= b and f.last_time >= a]
-        sg.warnings = list(node.warnings)
-        inside = [f for f in node.fixes if f[0] and a <= f[0] <= b]
-        _set_position(sg, node.fixes, (a, b))
-        if not inside and node.fixes:
-            sg.warnings.append("no GPS fix during this deployment - using all fixes")
+        # the whole node's position check doesn't apply to its deployments
+        sg.warnings = [w for w in node.warnings if w != node.position_warning]
+        _set_position(sg, node.fixes, (a, b), strict=True)
+        if sg.position_warning:
+            sg.warnings.insert(0, sg.position_warning)
+        if not sg.n_fixes and node.fixes:
+            sg.warnings.insert(0, "no GPS fix during this deployment - enter its "
+                                  "coordinates in the table")
         segs.append(sg)
     return segs
 
@@ -1127,7 +1172,12 @@ SCHEDULE_SNAP_HOURS = 12.0
 #  tolerance never goes below the floors, so a tight cluster of good fixes isn't
 #  trimmed for ordinary GPS jitter. Repeated until nothing more is rejected.
 POSITION_OUTLIER_SIGMA = 3.0
-POSITION_MIN_FIXES = 10           # fewer fixes during recording -> use all fixes
+POSITION_MIN_FIXES = 10           # unsplit node: fewer fixes during recording -> use all
+#  Warn if a deployment's fixes look like more than one place: the median of the
+#  first and second half (in time) differ by more than this, or the fixes kept
+#  scatter more than this (m), or over this fraction of fixes were rejected.
+POSITION_MOVE_WARN_M = 25.0
+POSITION_REJECT_WARN = 0.25
 POSITION_MIN_TOL_M = 5.0          # horizontal floor (m)
 ALTITUDE_MIN_TOL_M = 10.0         # vertical floor (m)
 
@@ -1749,10 +1799,16 @@ class HarvestDB:
         n = sum(self.file_done(node.serial, f, s, rot if f.component in "XY" else 0.0, gaps)
                 for f in files)
         if n == 0:
-            any_rows = any(self.con.execute(
-                "SELECT 1 FROM harvested WHERE serial=? AND fname=? AND size=? AND first_time=?",
-                (node.serial, f.name, f.size, self._t(f.first_time))).fetchone() for f in files)
-            return "partial" if any_rows else "new"
+            # anything harvested that overlaps THIS window (a file can be shared
+            # by several deployments of one node)
+            def touched(f):
+                w = file_window(f, s)
+                return self.con.execute(
+                    "SELECT 1 FROM harvested WHERE serial=? AND fname=? AND size=? AND "
+                    "first_time=? AND win_start < ? AND win_end > ?",
+                    (node.serial, f.name, f.size, self._t(f.first_time),
+                     self._t(w[1]), self._t(w[0]))).fetchone()
+            return "partial" if any(touched(f) for f in files) else "new"
         return "new" if n == 0 else ("harvested" if n == len(files) else
                                     f"partial ({n}/{len(files)} files)")
 
@@ -2358,6 +2414,130 @@ def archive_path(node: Node, raw_dir: str) -> str:
     return os.path.join(raw_dir, archive_name(node))
 
 
+def partial_archive_name(node: Node, intervals: list) -> str:
+    a = min(i[0] for i in intervals)
+    b = max(i[1] for i in intervals)
+    return f"{node.whole.serial}_{a:%Y%m%dT%H%M%S}-{b:%Y%m%dT%H%M%S}_part.tar.gz"
+
+
+def _merge_intervals(iv: list) -> list:
+    out = []
+    for a, b in sorted(iv):
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def covers_whole_node(node: Node, intervals: Optional[list]) -> bool:
+    """True if the intervals include all of the node's data."""
+    node = node.whole
+    if intervals is None or node.start is None:
+        return True
+    end = node.end + dt.timedelta(seconds=1.0 / (node.sample_rate or 1.0))
+    t = node.start
+    for a, b in _merge_intervals(intervals):
+        if a > t:
+            return False
+        t = max(t, b)
+    return t >= end
+
+
+def _overlaps(t0, t1, intervals) -> bool:
+    return any(t0 < b and t1 > a for a, b in intervals)
+
+
+def _mseed_ranges(path: str, intervals: list, cancelled=lambda: False) -> list:
+    """(offset, length) of whole MiniSEED records overlapping the intervals."""
+    out = []
+    with open(path, "rb") as fh:
+        reclen = _record_length(fh.read(256))
+        fh.seek(0)
+        off = 0
+        while True:
+            if cancelled():
+                raise Cancelled()
+            buf = fh.read(reclen * 16384)
+            if not buf:
+                break
+            for i in range(0, len(buf) - reclen + 1, reclen):
+                if buf[i + 6:i + 7] in (b"D", b"R", b"Q", b"M"):
+                    t0, n, sr = _rec_start(buf[i:i + 64])
+                    t1 = t0 + dt.timedelta(seconds=(n / sr) if sr else 0)
+                    if _overlaps(t0, t1, intervals):
+                        out.append((off + i, reclen))
+            off += len(buf) - len(buf) % reclen
+            if len(buf) % reclen:
+                break
+    return out
+
+
+def _dld_ranges(path: str, intervals: list, sr_hint=None, cancelled=lambda: False) -> list:
+    """(offset, length): the DLD header plus every whole block (samples + its
+    time tag) overlapping the intervals; samples after the last tag are kept if
+    the last block is."""
+    ns, period = dld_layout(path)
+    _, _, sr, _ = dld_extent(path, sr_hint)
+    step = dt.timedelta(seconds=ns / sr)
+    shift = step if DLD_TAG_MARKS == "block_end" else dt.timedelta(0)
+    size = os.path.getsize(path)
+    nblk = (size - DLD_HDR) // period
+    out = [(0, DLD_HDR)]
+    last_kept = False
+    with open(path, "rb") as fh:
+        for k0 in range(0, nblk, 4096):
+            if cancelled():
+                raise Cancelled()
+            fh.seek(DLD_HDR + k0 * period)
+            buf = fh.read(min(4096, nblk - k0) * period)
+            for i in range(len(buf) // period):
+                t = _dld_tag(buf[i * period + ns * 3:(i + 1) * period])[0]
+                last_kept = bool(t) and _overlaps(t - shift, t - shift + step, intervals)
+                if last_kept:
+                    out.append((DLD_HDR + (k0 + i) * period, period))
+    rem = size - DLD_HDR - nblk * period
+    if rem and last_kept:
+        out.append((DLD_HDR + nblk * period, rem))
+    return out
+
+
+class _RangesReader:
+    """Read the given (offset, length) ranges of a file as one stream."""
+
+    def __init__(self, path, ranges):
+        merged = []
+        for o, n in ranges:
+            if merged and merged[-1][0] + merged[-1][1] == o:
+                merged[-1] = (merged[-1][0], merged[-1][1] + n)
+            else:
+                merged.append((o, n))
+        self.fh = open(path, "rb")
+        self.ranges, self.i, self.left = merged, 0, merged[0][1] if merged else 0
+        if merged:
+            self.fh.seek(merged[0][0])
+
+    def read(self, n=-1):
+        out = bytearray()
+        while self.i < len(self.ranges) and (n < 0 or len(out) < n):
+            if self.left == 0:
+                self.i += 1
+                if self.i < len(self.ranges):
+                    self.fh.seek(self.ranges[self.i][0])
+                    self.left = self.ranges[self.i][1]
+                continue
+            want = self.left if n < 0 else min(self.left, n - len(out))
+            b = self.fh.read(want)
+            if not b:
+                break
+            out += b
+            self.left -= len(b)
+        return bytes(out)
+
+    def close(self):
+        self.fh.close()
+
+
 def _archive_files(root: str) -> List[str]:
     out = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -2409,6 +2589,211 @@ def is_volume_root(path: str) -> bool:
     return path not in ("/",) and not path.startswith(("/proc", "/sys", "/dev", "/run/user"))
 
 
+# --------------------------------------------------------------------------- #
+# Windows: safe removal of one USB node volume (no extra packages needed)
+#   1. flush, lock and dismount the volume (retrying while Windows Search,
+#      antivirus or Explorer briefly hold it open) - after this nothing more
+#      can be written and the node can be unplugged safely;
+#   2. ask Windows to eject the USB device (CM_Request_Device_Eject), which
+#      names the program/device that vetoes it if it refuses;
+#   3. if that fails, eject the media (IOCTL_STORAGE_EJECT_MEDIA).
+# --------------------------------------------------------------------------- #
+
+_PNP_VETO = {1: "a legacy device", 2: "a pending close", 3: "a Windows application",
+             4: "a Windows service", 5: "files open on it", 6: "a device",
+             7: "a driver", 8: "an illegal device request", 9: "insufficient power",
+             10: "a device that can't be disabled", 11: "a legacy driver",
+             12: "insufficient rights"}
+
+
+def _win_api():
+    import ctypes
+    from ctypes import wintypes as W
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, ctypes.c_void_p, W.DWORD,
+                                W.DWORD, W.HANDLE]
+    k32.CreateFileW.restype = W.HANDLE
+    k32.DeviceIoControl.argtypes = [W.HANDLE, W.DWORD, ctypes.c_void_p, W.DWORD,
+                                    ctypes.c_void_p, W.DWORD, ctypes.POINTER(W.DWORD),
+                                    ctypes.c_void_p]
+    k32.DeviceIoControl.restype = W.BOOL
+    k32.CloseHandle.argtypes = [W.HANDLE]
+    k32.FlushFileBuffers.argtypes = [W.HANDLE]
+    return ctypes, W, k32
+
+
+class _StorageDeviceNumber(__import__("ctypes").Structure):
+    _fields_ = [("DeviceType", __import__("ctypes").c_ulong),
+                ("DeviceNumber", __import__("ctypes").c_ulong),
+                ("PartitionNumber", __import__("ctypes").c_ulong)]
+
+
+def _win_open(ctypes, k32, path: str, access: int):
+    h = k32.CreateFileW(path, access, 0x1 | 0x2, None, 3, 0, None)  # share R|W, OPEN_EXISTING
+    if h is None or h == ctypes.c_void_p(-1).value:
+        raise OSError(ctypes.get_last_error(), f"cannot open {path}")
+    return h
+
+
+def _win_ioctl(ctypes, W, k32, h, code, inbuf=None, insize=0, outbuf=None, outsize=0):
+    ret = W.DWORD(0)
+    ok = k32.DeviceIoControl(h, code,
+                             ctypes.addressof(inbuf) if inbuf is not None else None, insize,
+                             ctypes.addressof(outbuf) if outbuf is not None else None, outsize,
+                             ctypes.byref(ret), None)
+    return bool(ok), ctypes.get_last_error()
+
+
+def _win_device_number(ctypes, W, k32, h):
+    sdn = _StorageDeviceNumber()
+    ok, _ = _win_ioctl(ctypes, W, k32, h, 0x002D1080, None, 0,      # GET_DEVICE_NUMBER
+                       sdn, ctypes.sizeof(sdn))
+    return (sdn.DeviceType, sdn.DeviceNumber) if ok else None
+
+
+def _win_request_eject(devnum) -> Tuple[bool, str]:
+    """Eject the USB device holding disk number devnum. (ok, veto reason)."""
+    ctypes, W, k32 = _win_api()
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                    ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+    class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
+        _fields_ = [("cbSize", W.DWORD), ("InterfaceClassGuid", GUID), ("Flags", W.DWORD),
+                    ("Reserved", ctypes.c_size_t)]
+
+    class SP_DEVINFO_DATA(ctypes.Structure):
+        _fields_ = [("cbSize", W.DWORD), ("ClassGuid", GUID), ("DevInst", W.DWORD),
+                    ("Reserved", ctypes.c_size_t)]
+
+    disk_guid = GUID(0x53F56307, 0xB6BF, 0x11D0,
+                     (ctypes.c_ubyte * 8)(0x94, 0xF2, 0x00, 0xA0, 0xC9, 0x1E, 0xFB, 0x8B))
+    sa = ctypes.WinDLL("setupapi", use_last_error=True)
+    cm = ctypes.WinDLL("cfgmgr32")
+    sa.SetupDiGetClassDevsW.argtypes = [ctypes.c_void_p, W.LPCWSTR, W.HWND, W.DWORD]
+    sa.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+    sa.SetupDiEnumDeviceInterfaces.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                               ctypes.c_void_p, W.DWORD, ctypes.c_void_p]
+    sa.SetupDiEnumDeviceInterfaces.restype = W.BOOL
+    sa.SetupDiGetDeviceInterfaceDetailW.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                                    ctypes.c_void_p, W.DWORD,
+                                                    ctypes.POINTER(W.DWORD), ctypes.c_void_p]
+    sa.SetupDiGetDeviceInterfaceDetailW.restype = W.BOOL
+    sa.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+    cm.CM_Get_Parent.argtypes = [ctypes.POINTER(W.DWORD), W.DWORD, W.ULONG]
+    cm.CM_Request_Device_EjectW.argtypes = [W.DWORD, ctypes.POINTER(ctypes.c_int),
+                                            W.LPWSTR, W.ULONG, W.ULONG]
+    hdev = sa.SetupDiGetClassDevsW(ctypes.addressof(disk_guid), None, None, 0x2 | 0x10)
+    if not hdev or hdev == ctypes.c_void_p(-1).value:
+        return False, "cannot list disk devices"
+    try:
+        devinst = None
+        i = 0
+        while devinst is None:
+            ifd = SP_DEVICE_INTERFACE_DATA(); ifd.cbSize = ctypes.sizeof(ifd)
+            if not sa.SetupDiEnumDeviceInterfaces(hdev, None, ctypes.addressof(disk_guid), i,
+                                                  ctypes.addressof(ifd)):
+                break
+            i += 1
+            need = W.DWORD(0)
+            sa.SetupDiGetDeviceInterfaceDetailW(hdev, ctypes.addressof(ifd), None, 0,
+                                                ctypes.byref(need), None)
+            if not need.value:
+                continue
+            buf = ctypes.create_string_buffer(need.value)
+            ctypes.c_ulong.from_buffer(buf).value = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
+            dinfo = SP_DEVINFO_DATA(); dinfo.cbSize = ctypes.sizeof(dinfo)
+            if not sa.SetupDiGetDeviceInterfaceDetailW(hdev, ctypes.addressof(ifd),
+                                                       ctypes.addressof(buf), need,
+                                                       None, ctypes.addressof(dinfo)):
+                continue
+            dpath = ctypes.wstring_at(ctypes.addressof(buf) + 4)
+            try:
+                h = _win_open(ctypes, k32, dpath, 0)
+            except OSError:
+                continue
+            try:
+                if _win_device_number(ctypes, W, k32, h) == devnum:
+                    devinst = dinfo.DevInst
+            finally:
+                k32.CloseHandle(h)
+    finally:
+        sa.SetupDiDestroyDeviceInfoList(hdev)
+    if devinst is None:
+        return False, "USB device for this drive not found"
+    parent = W.DWORD(0)
+    if cm.CM_Get_Parent(ctypes.byref(parent), devinst, 0) != 0:
+        return False, "parent USB device not found"
+    import time
+    reason = ""
+    for _ in range(3):
+        veto = ctypes.c_int(0)
+        name = ctypes.create_unicode_buffer(260)
+        r = cm.CM_Request_Device_EjectW(parent.value, ctypes.byref(veto), name, 260, 0)
+        if r == 0 and veto.value == 0:
+            return True, ""
+        reason = (f"Windows refused: {_PNP_VETO.get(veto.value, 'code %d' % r)}"
+                  + (f" ({name.value})" if name.value else ""))
+        time.sleep(0.5)
+    return False, reason
+
+
+def _win_unmount(path: str, lock_timeout: float = 10.0) -> Tuple[bool, str]:
+    import time
+    ctypes, W, k32 = _win_api()
+    drive = os.path.splitdrive(os.path.abspath(path))[0]            # 'E:'
+    if len(drive) != 2:
+        return False, f"{path} is not a drive"
+    vol = "\\\\.\\" + drive
+    try:
+        try:
+            h = _win_open(ctypes, k32, vol, 0x80000000 | 0x40000000)  # GENERIC_READ|WRITE
+        except OSError:
+            h = _win_open(ctypes, k32, vol, 0x80000000)
+    except OSError as e:
+        return False, f"cannot open {drive} (error {e.args[0]})"
+    locked = dismounted = False
+    devnum = None
+    try:
+        k32.FlushFileBuffers(h)
+        t_end = time.monotonic() + lock_timeout
+        while True:
+            locked, err = _win_ioctl(ctypes, W, k32, h, 0x00090018)   # FSCTL_LOCK_VOLUME
+            if locked or time.monotonic() > t_end:
+                break
+            time.sleep(0.5)
+        if locked:
+            dismounted, _ = _win_ioctl(ctypes, W, k32, h, 0x00090020)  # FSCTL_DISMOUNT_VOLUME
+            allow = ctypes.c_ubyte(0)
+            _win_ioctl(ctypes, W, k32, h, 0x002D4804, allow, 1)      # allow media removal
+        devnum = _win_device_number(ctypes, W, k32, h)
+    finally:
+        k32.CloseHandle(h)
+    ejected, why = (_win_request_eject(devnum) if devnum else (False, "no device number"))
+    if not ejected and locked:
+        try:
+            h = _win_open(ctypes, k32, vol, 0x80000000)
+            try:
+                _win_ioctl(ctypes, W, k32, h, 0x00090018)
+                ejected, _ = _win_ioctl(ctypes, W, k32, h, 0x002D4808)  # EJECT_MEDIA
+            finally:
+                k32.CloseHandle(h)
+        except OSError:
+            pass
+    if ejected:
+        for _ in range(40):                 # drive letter goes away shortly after
+            if not os.path.exists(drive + "\\\\"):
+                break
+            time.sleep(0.25)
+        return True, "ejected - safe to remove"
+    if dismounted:
+        return True, ("dismounted - safe to unplug (Windows did not eject it: "
+                      f"{why or 'unknown reason'})")
+    return False, ("in use by another program - close any Explorer windows or programs "
+                   "using it and try again" + (f"; {why}" if why else ""))
+
+
 def unmount_volume(path: str, timeout: float = 30.0) -> Tuple[bool, str]:
     """Unmount / eject one node volume. Returns (ok, message)."""
     import subprocess
@@ -2422,11 +2807,11 @@ def unmount_volume(path: str, timeout: float = 30.0) -> Tuple[bool, str]:
         return not os.path.ismount(path)
 
     if sys.platform.startswith("win"):
-        drive = path[:2]                                      # 'E:'
-        ps = ("$d=(New-Object -ComObject Shell.Application).Namespace(17).ParseName('%s');"
-              "if($d){$d.InvokeVerb('Eject')}" % drive)
-        cmds = [["powershell", "-NoProfile", "-NonInteractive", "-Command", ps]]
-    elif sys.platform == "darwin":
+        try:
+            return _win_unmount(path)
+        except Exception as e:  # noqa - never let a Windows API problem crash the GUI
+            return False, f"Windows eject error: {e}"
+    if sys.platform == "darwin":
         cmds = [["diskutil", "unmount", path]]
     else:
         dev = bytes(QStorageInfo(path).device()).decode(errors="replace")
@@ -2440,17 +2825,25 @@ def unmount_volume(path: str, timeout: float = 30.0) -> Tuple[bool, str]:
         except (OSError, subprocess.TimeoutExpired) as e:
             last = str(e)
             continue
-        for _ in range(20):                                   # eject is asynchronous on Windows
+        for _ in range(40):
             if gone():
-                return True, "unmounted"
+                return True, "unmounted - safe to remove"
             time.sleep(0.25)
     return False, last or "unmount failed"
 
 
 def archive_node(node: Node, raw_dir: str, progress: Callable[[int], None] = None,
-                 cancelled: Callable[[], bool] = lambda: False) -> Tuple[str, bool]:
-    """Write the whole node volume to raw_dir/<archive_name>. Returns
-    (path, created); created is False if the archive already existed."""
+                 cancelled: Callable[[], bool] = lambda: False,
+                 intervals: Optional[list] = None) -> Tuple[str, bool]:
+    """Back up a node volume to raw_dir. Returns (path, created); created is
+    False if that archive already existed.
+    intervals None, or covering all the node's data: the whole volume, file
+    for file (<serial>_<days>.tar.gz).
+    Otherwise a partial archive (<serial>_<start>-<end>_part.tar.gz): every
+    non-data file, and of each data file only the whole MiniSEED records / DLD
+    blocks that overlap the intervals (byte for byte, so it can be loaded and
+    harvested again); data files with nothing in the intervals are left out."""
+    import io
     import tarfile
     node = node.whole
     if not node_present(node.path):
@@ -2458,10 +2851,15 @@ def archive_node(node: Node, raw_dir: str, progress: Callable[[int], None] = Non
     files = _archive_files(node.path)
     if not files:
         raise NotMounted(f"{node.serial}: no files found in {node.path}")
+    full = covers_whole_node(node, intervals)
+    if not full:
+        intervals = _merge_intervals(intervals)
     os.makedirs(raw_dir, exist_ok=True)
-    dest = archive_path(node, raw_dir)
+    dest = archive_path(node, raw_dir) if full else \
+        os.path.join(raw_dir, partial_archive_name(node, intervals))
     if os.path.exists(dest):
         return dest, False
+    data_files = {os.path.normcase(os.path.abspath(f.path)): f for f in node.files}
     tmp = dest + ".part"
     manifest = []
     try:
@@ -2470,17 +2868,38 @@ def archive_node(node: Node, raw_dir: str, progress: Callable[[int], None] = Non
                 if cancelled():
                     raise Cancelled()
                 rel = os.path.relpath(p, node.path).replace(os.sep, "/")
-                arc = f"{node.serial}/{rel}"
-                ti = tar.gettarinfo(p, arcname=arc)
-                with open(p, "rb") as fh:
-                    r = _HashingReader(fh, progress)
-                    tar.addfile(ti, r)
+                ti = tar.gettarinfo(p, arcname=f"{node.serial}/{rel}")
+                cf = None if full else data_files.get(os.path.normcase(os.path.abspath(p)))
+                if cf is None:
+                    with open(p, "rb") as fh:
+                        r = _HashingReader(fh, progress)
+                        tar.addfile(ti, r)
+                else:
+                    ranges = (_dld_ranges(p, intervals, node.sample_rate_par, cancelled)
+                              if cf.fmt == "dld" else _mseed_ranges(p, intervals, cancelled))
+                    n = sum(x[1] for x in ranges)
+                    if cf.fmt == "dld" and len(ranges) <= 1:
+                        n = 0                                  # header only: no data
+                    if n == 0:
+                        continue
+                    ti.size = n
+                    src = _RangesReader(p, ranges)
+                    try:
+                        r = _HashingReader(src, progress)
+                        tar.addfile(ti, r)
+                    finally:
+                        src.close()
                 manifest.append(f"{r.h.hexdigest()}  {rel}")
+            info = "full" if full else "partial: " + ", ".join(
+                f"{a:%Y-%m-%dT%H:%M:%S}/{b:%Y-%m-%dT%H:%M:%S}" for a, b in intervals)
             data = ("\n".join(manifest) + "\n").encode()
-            import io
             ti = tarfile.TarInfo(f"{node.serial}/{MANIFEST_NAME}")
             ti.size, ti.mtime = len(data), int(dt.datetime.now().timestamp())
             tar.addfile(ti, io.BytesIO(data))
+            note = (f"DumbSolo {__version__} archive of {node.serial}: {info}\n").encode()
+            ti = tarfile.TarInfo(f"{node.serial}/ARCHIVE_INFO.txt")
+            ti.size, ti.mtime = len(note), int(dt.datetime.now().timestamp())
+            tar.addfile(ti, io.BytesIO(note))
         os.replace(tmp, dest)
     except BaseException:
         if os.path.exists(tmp):
@@ -2493,7 +2912,8 @@ def extract_archive(path: str, dest_root: str, progress: Callable[[int], None] =
                     cancelled: Callable[[], bool] = lambda: False,
                     log: Callable[[str], None] = print) -> str:
     """Extract a node archive to dest_root/<archive stem>/ (reused if already
-    extracted), verifying the SHA-256 manifest. Returns the folder."""
+    extracted), verifying the SHA-256 manifest. Returns the folder.
+    progress() is fed compressed bytes of the archive (see archive_total_bytes)."""
     import hashlib
     import shutil
     import tarfile
@@ -2504,14 +2924,24 @@ def extract_archive(path: str, dest_root: str, progress: Callable[[int], None] =
             break
     dest = os.path.join(dest_root, stem)
     if os.path.isfile(os.path.join(dest, EXTRACTED_MARK)):
+        if progress:
+            progress(os.path.getsize(path))
         return dest
     tmp = dest + ".part"
     if os.path.exists(tmp):
         shutil.rmtree(tmp)
     os.makedirs(tmp)
     hashes, manifest = {}, None
+    done = 0
+
+    def report():
+        nonlocal done
+        pos = fh.tell()
+        if progress and pos > done:
+            progress(pos - done)
+            done = pos
     try:
-        with tarfile.open(path, "r:*") as tar:
+        with open(path, "rb") as fh, tarfile.open(fileobj=fh, mode="r:*") as tar:
             for m in tar:
                 if cancelled():
                     raise Cancelled()
@@ -2533,8 +2963,9 @@ def extract_archive(path: str, dest_root: str, progress: Callable[[int], None] =
                             break
                         h.update(b)
                         out.write(b)
-                        if progress:
-                            progress(len(b))
+                        report()
+                        if cancelled():
+                            raise Cancelled()
                 os.utime(target, (m.mtime, m.mtime))
                 hashes["/".join(parts[1:])] = h.hexdigest()
         if manifest is None:
@@ -2545,6 +2976,8 @@ def extract_archive(path: str, dest_root: str, progress: Callable[[int], None] =
             if bad:
                 raise ValueError(f"{os.path.basename(path)}: checksum mismatch for "
                                  f"{len(bad)} file(s): {', '.join(bad[:5])}")
+        if progress and os.path.getsize(path) > done:
+            progress(os.path.getsize(path) - done)
         open(os.path.join(tmp, EXTRACTED_MARK), "w").write(path + "\n")
         if os.path.exists(dest):
             shutil.rmtree(dest)
@@ -2556,10 +2989,38 @@ def extract_archive(path: str, dest_root: str, progress: Callable[[int], None] =
 
 
 def archive_total_bytes(path: str) -> int:
-    """Uncompressed size of an archive's files (for progress)."""
-    import tarfile
-    with tarfile.open(path, "r:*") as tar:
-        return sum(m.size for m in tar if m.isfile())
+    """Progress total for extract_archive: the archive's size on disk (cheap -
+    no need to decompress the archive just to count it)."""
+    return os.path.getsize(path)
+
+
+def extract_archives(files, dest_root, progress=None, cancelled=lambda: False,
+                     log=print, workers: int = 2) -> list:
+    """Extract several archives, a few at a time. A bad archive is reported and
+    skipped instead of stopping the others. Returns [(archive, folder)]."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def one(f):
+        if cancelled():
+            raise Cancelled()
+        return extract_archive(f, dest_root, progress, cancelled, log)
+    out = []
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(files)))) as ex:
+        futs = {ex.submit(one, f): f for f in files}
+        for fu in as_completed(futs):
+            f = futs[fu]
+            try:
+                d = fu.result()
+            except Cancelled:
+                for other in futs:
+                    other.cancel()
+                raise
+            except Exception as e:  # noqa
+                log(f"{os.path.basename(f)}: could not be loaded - {e}")
+                continue
+            log(f"{os.path.basename(f)}: extracted")
+            out.append((f, d))
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -2688,15 +3149,6 @@ def fmt_dur(seconds: float) -> str:
     return (f"{d}d " if d else "") + f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def to_qdt(t: dt.datetime) -> QDateTime:
-    secs = int(t.replace(tzinfo=dt.timezone.utc).timestamp())
-    return QDateTime.fromSecsSinceEpoch(secs, QTimeZone.utc())
-
-
-def from_qdt(q: QDateTime) -> dt.datetime:
-    return dt.datetime.fromtimestamp(q.toSecsSinceEpoch(), tz=dt.timezone.utc).replace(tzinfo=None)
-
-
 def override_key(node: Node) -> str:
     """Per-deployment key for saved user edits: serial@deployment-start."""
     return f"{node.serial}@{node.start:%Y-%m-%dT%H:%M:%S}" if node.start else node.serial
@@ -2730,12 +3182,14 @@ class HarvestWorker(QThread):
                 done[0] += b
                 self.event.emit(("archive_progress", done[0]))
 
-        def one(n):
+        def one(item):
+            n, intervals = item
             if self._cancel:
                 return
             self.event.emit(("status", n.path, "archiving..."))
             try:
-                path, made = archive_node(n, self.raw_dir, prog, lambda: self._cancel)
+                path, made = archive_node(n, self.raw_dir, prog, lambda: self._cancel,
+                                          intervals)
                 self.log.emit(f"{n.serial}: " + (f"archived to {os.path.basename(path)} "
                                                  f"({mb(os.path.getsize(path))} MB)" if made else
                                                  f"already archived ({os.path.basename(path)})"))
@@ -2750,7 +3204,7 @@ class HarvestWorker(QThread):
                 ok[0] = False
                 self.log.emit(f"{n.serial}: archive FAILED: {e}")
                 self.event.emit(("status", n.path, "archive error"))
-        self.log.emit(f"Archiving {len(self.archive)} node volume(s) to {self.raw_dir} "
+        self.log.emit(f"Archiving {len(self.archive)} node(s) to {self.raw_dir} "
                       f"(gzip level {ARCHIVE_COMPRESSLEVEL})")
         with ThreadPoolExecutor(max_workers=max(1, self.workers)) as ex:
             list(ex.map(one, self.archive))
@@ -2805,13 +3259,22 @@ class TaskWorker(QThread):
         self.fn = fn
         self._cancel = False
         self._bytes = 0
+        self._last = 0
+        import threading
+        self._lock = threading.Lock()
 
     def cancel(self):
         self._cancel = True
 
     def _progress(self, n):
-        self._bytes += n
-        self.progress.emit(self._bytes)
+        with self._lock:                       # may be called from several threads
+            self._bytes += n
+            now = time.monotonic()
+            if now - self._last < 0.1:
+                return                         # don't flood the GUI with signals
+            self._last = now
+            b = self._bytes
+        self.progress.emit(b)
 
     def run(self):
         try:
@@ -2829,17 +3292,27 @@ class NodeLoader(QThread):
     loaded = Signal(object, str)       # Node, archive source ("" for volumes)
     failed = Signal(str, str)          # path, error
 
-    def __init__(self, paths, archive_src: str = "", workers: int = 4):
+    import threading
+    _slots = threading.BoundedSemaphore(4)     # node reads at once, over ALL loaders
+
+    def __init__(self, paths, archive_src="", workers: int = 4):
+        """archive_src: one source for all paths, or {path: source}."""
         super().__init__()
-        self.paths, self.archive_src, self.workers = paths, archive_src, workers
+        self.paths, self.workers = paths, workers
+        self.src = archive_src if isinstance(archive_src, dict) else \
+            {p: archive_src for p in paths}
+
+    def _load(self, p):
+        with NodeLoader._slots:
+            return load_node(p)
 
     def run(self):
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=max(1, self.workers)) as ex:
-            futs = {ex.submit(load_node, p): p for p in self.paths}
+        with ThreadPoolExecutor(max_workers=max(1, min(self.workers, 4))) as ex:
+            futs = {ex.submit(self._load, p): p for p in self.paths}
             for f in as_completed(futs):
                 try:
-                    self.loaded.emit(f.result(), self.archive_src)
+                    self.loaded.emit(f.result(), self.src.get(futs[f], ""))
                 except Exception as e:  # noqa
                     self.failed.emit(futs[f], str(e))
 
@@ -2865,7 +3338,8 @@ class MainWindow(QMainWindow):
         self.project: Optional[Project] = None
         self._overrides: Dict[str, dict] = {}       # used when no project is open
         self._schedule: List[dict] = []             # likewise
-        self._range_custom = False                  # user edited the time range
+        self._auto_unticked: set = set()            # rows unticked for being out of range
+        self._range_auto = True                     # time range follows the loaded data
         self._status: Dict[str, str] = {}           # row key -> transient status text
         self._run_paths: set = set()                # node paths used by the running task
 
@@ -2995,20 +3469,28 @@ class MainWindow(QMainWindow):
 
         g_time = QGroupBox("Time range (UTC)")
         f = QFormLayout(g_time)
-        self.dt_from = QDateTimeEdit(calendarPopup=True)
-        self.dt_to = QDateTimeEdit(calendarPopup=True)
+        self.dt_from = QLineEdit(placeholderText="earliest loaded data")
+        self.dt_to = QLineEdit(placeholderText="latest loaded data")
+        fmt_tip = ("\nYYYY-MM-DD, YYYY-MM-DD HH:MM or YYYY-MM-DD HH:MM:SS (UTC)."
+                   "\nFilled with the span of the loaded data until you edit it."
+                   "\nEmpty = no limit.")
+        self.dt_from.setToolTip("Inclusive" + fmt_tip)
+        self.dt_to.setToolTip("Exclusive" + fmt_tip)
         for w in (self.dt_from, self.dt_to):
-            w.setTimeZone(QTimeZone.utc())
-            w.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
-            w.dateTimeChanged.connect(self._range_edited)
-            w.editingFinished.connect(self.refresh_harvest_status)
-        self.dt_from.setToolTip("Inclusive")
-        self.dt_to.setToolTip("Exclusive")
+            w.textEdited.connect(self._range_edited)
+            w.editingFinished.connect(self._range_done)
+        self._range_timer = QTimer(self, singleShot=True, interval=600,
+                                   timeout=self.refresh_harvest_status)
         b = QPushButton("All loaded data")
         b.clicked.connect(self.reset_range)
+        self.chk_hide_out = QCheckBox("Hide deployments outside the range", checked=True)
+        self.chk_hide_out.setToolTip("Deployments with no data in the range are always unticked\n"
+                                     "and never harvested; this also hides their rows.")
+        self.chk_hide_out.toggled.connect(lambda *_: self._apply_range())
         f.addRow("From", self.dt_from)
         f.addRow("To", self.dt_to)
         f.addRow(b)
+        f.addRow(self.chk_hide_out)
         left.addWidget(g_time)
 
         g_out = QGroupBox("Output")
@@ -3334,34 +3816,116 @@ class MainWindow(QMainWindow):
         return os.path.join(self.raw_dir(), "extracted") if self.raw_dir() else ""
 
     # ---------------- time range ----------------
+    @staticmethod
+    def _parse_time(text: str):
+        """'' -> None (no limit); a UTC date/time -> datetime; anything else
+        raises ValueError."""
+        t = text.strip().replace("T", " ").rstrip("Zz").strip()
+        if not t:
+            return None
+        for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return dt.datetime.strptime(t, f)
+            except ValueError:
+                pass
+        raise ValueError(text)
+
+    def _range_field(self, w):
+        """Parsed value of one range field; marks it red if it can't be read."""
+        try:
+            v = self._parse_time(w.text())
+            w.setStyleSheet("")
+            return v, True
+        except ValueError:
+            w.setStyleSheet("QLineEdit { background: #f8d0d0; }")
+            return None, False
+
+    def range_valid(self) -> bool:
+        return self._range_field(self.dt_from)[1] and self._range_field(self.dt_to)[1]
+
     def _data_span(self, extra=()):
+        """(earliest start, latest end + 1 s) of the loaded deployments."""
         nodes = list(self.rows.values()) + list(extra)
         starts = [n.start for n in nodes if n.start]
         ends = [n.end for n in nodes if n.end]
-        if not starts:
+        if not starts or not ends:
             return None
         t0 = min(starts).replace(microsecond=0)
         t1 = max(ends).replace(microsecond=0) + dt.timedelta(seconds=1)   # 'To' is exclusive
         return t0, t1
 
-    def _set_range(self, t0, t1):
-        for w, t in ((self.dt_from, t0), (self.dt_to, t1)):
-            w.blockSignals(True); w.setDateTime(to_qdt(t)); w.blockSignals(False)
+    def _fill_range(self, extra=()):
+        """While the user hasn't edited it, keep the range = span of the loaded data."""
+        if not self._range_auto:
+            return
+        span = self._data_span(extra)
+        for w, t in zip((self.dt_from, self.dt_to), span or (None, None)):
+            w.setText(f"{t:%Y-%m-%d %H:%M:%S}" if t else "")
+            w.setStyleSheet("")
 
     def reset_range(self):
-        span = self._data_span()
-        if span:
-            self._set_range(*span)
-        self._range_custom = False
+        self._range_auto = True
+        self._fill_range()
         self.refresh_harvest_status()
 
     def _range_edited(self, *_):
-        self._range_custom = True
+        self._range_auto = False
+        self._range_timer.start()            # refresh once the user stops typing
+
+    def _range_done(self):
+        if not self.dt_from.text().strip() and not self.dt_to.text().strip():
+            self._range_auto = True          # both cleared: follow the data again
+            self._fill_range()
+        self.refresh_harvest_status()
+
+    def in_range(self, node) -> bool:
+        """True if this deployment has data inside the time range."""
+        t0, t1 = self.window()
+        if node.start is None:
+            return True
+        if t0 is not None and node.end is not None and node.end < t0:
+            return False
+        if t1 is not None and node.start >= t1:
+            return False
+        return True
+
+    def _apply_range(self):
+        """Grey out, untick (and optionally hide) deployments with no data in
+        the time range; restore those that come back into it."""
+        grey = QColor("#9a9a9a")
+        hide = self.chk_hide_out.isChecked()
+        self.table.blockSignals(True)
+        for r in range(self.table.rowCount()):
+            key = self._key(r)
+            node = self.rows.get(key)
+            if node is None:
+                continue
+            inside = self.in_range(node)
+            sn = self.table.item(r, C_SN)
+            if not inside:
+                if sn.checkState() == Qt.Checked:
+                    sn.setCheckState(Qt.Unchecked)
+                    self._auto_unticked.add(key)
+                self.table.item(r, C_HARV).setText("outside time range")
+            elif key in self._auto_unticked:
+                sn.setCheckState(Qt.Checked)
+                self._auto_unticked.discard(key)
+            for c in range(len(COLS)):
+                it = self.table.item(r, c)
+                if it is None:
+                    continue
+                if not inside:
+                    it.setForeground(grey)
+                elif it.foreground().color() == grey:
+                    it.setForeground(QColor())
+            if inside:
+                self._paint_harvest(self.table.item(r, C_HARV))
+            self.table.setRowHidden(r, hide and not inside)
+        self.table.blockSignals(False)
 
     def window(self):
-        if not self.rows:
-            return None, None
-        return from_qdt(self.dt_from.dateTime()), from_qdt(self.dt_to.dateTime())
+        """(From, To) of the time range; None = no limit (or unreadable)."""
+        return self._range_field(self.dt_from)[0], self._range_field(self.dt_to)[0]
 
     # ---------------- helpers ----------------
     def settings(self) -> Settings:
@@ -3409,6 +3973,7 @@ class MainWindow(QMainWindow):
         self.table.blockSignals(False)
         if db:
             db.close()
+        self._apply_range()
 
     def log(self, msg):
         self.logbox.appendPlainText(msg)
@@ -3473,10 +4038,13 @@ class MainWindow(QMainWindow):
         self.log(f"{d}: {len(dirs)} node folder(s) found")
         self.load_paths(dirs)
 
-    def load_paths(self, paths, archive_src: str = ""):
-        """Read nodes in the background; rows appear as each one finishes."""
+    def load_paths(self, paths, archive_src=""):
+        """Read nodes in the background; rows appear as each one finishes.
+        archive_src: one source for all paths, or {path: source}."""
+        if isinstance(archive_src, dict):
+            archive_src = {os.path.abspath(p): s for p, s in archive_src.items()}
         paths = [os.path.abspath(p) for p in paths]
-        paths = [p for p in paths if p not in self.bases and p not in self._loading]
+        paths = [p for p in dict.fromkeys(paths) if p not in self.bases and p not in self._loading]
         if not paths:
             return
         self._loading.update(paths)
@@ -3511,10 +4079,7 @@ class MainWindow(QMainWindow):
         segs = self._segments(node)
         # widen the time range BEFORE filling the rows, so their Harvest status
         # (and default check mark) is computed against the new range
-        if not self._range_custom:
-            span = self._data_span(extra=segs)
-            if span:
-                self._set_range(*span)
+        self._fill_range(extra=segs)
         for sg in segs:
             self._add_row(sg)
         self._mark_duplicates()
@@ -3522,8 +4087,10 @@ class MainWindow(QMainWindow):
         if len(segs) > 1:
             msg += f", split into {len(segs)} deployments at gaps > {self.sp_gap.value():g} h"
         self.log(msg)
-        if node.warnings:
-            self.log(f"{node.serial}: " + "; ".join(node.warnings))
+        warns = [w for w in node.warnings
+                 if not (len(segs) > 1 and w == node.position_warning)]  # checked per deployment
+        if warns:
+            self.log(f"{node.serial}: " + "; ".join(warns))
 
     def _segments(self, base) -> List[Node]:
         forced, notes = schedule_splits(base, self.schedule())
@@ -3561,10 +4128,7 @@ class MainWindow(QMainWindow):
                 self._add_row(sg, checks.get(sg.key))
         self.table.blockSignals(False)
         self.table.setSortingEnabled(True)
-        if not self._range_custom:
-            span = self._data_span()
-            if span:
-                self._set_range(*span)
+        self._fill_range()
         self.refresh_harvest_status()
         self._mark_duplicates()
 
@@ -3607,6 +4171,10 @@ class MainWindow(QMainWindow):
         sn.setData(KEY_ROLE, node.key)
         sn.setFlags(sn.flags() | Qt.ItemIsUserCheckable)
         no_data = not node.files or node.start is None or node.whole.data_bytes == 0
+        if check is None and not self.in_range(node) and not no_data and \
+                hstat != "harvested" and node.gains_consistent:
+            self._auto_unticked.add(node.key)        # re-ticked if it comes into range
+            check = Qt.Unchecked
         if check is None:
             check = Qt.Checked if (not no_data and hstat != "harvested" and
                                    node.gains_consistent) else Qt.Unchecked
@@ -3653,6 +4221,11 @@ class MainWindow(QMainWindow):
         if node.latitude is None:
             for c in (C_LAT, C_LON, C_ELV):
                 vals[c].setBackground(PINK)
+        if not self.in_range(node):
+            vals[C_HARV].setText("outside time range")
+            for it in vals.values():
+                it.setForeground(QColor("#9a9a9a"))
+            self.table.setRowHidden(r, self.chk_hide_out.isChecked())
 
     def _mark_duplicates(self):
         """Station codes used by more than one row are highlighted red."""
@@ -3675,6 +4248,9 @@ class MainWindow(QMainWindow):
 
     def _item_changed(self, it):
         r, c = it.row(), it.column()
+        if c == C_SN:
+            self._auto_unticked.discard(self._key(r))
+            return
         if c not in EDITABLE:
             return
         node = self.rows.get(self._key(r))
@@ -3868,12 +4444,12 @@ class MainWindow(QMainWindow):
         self.log(f"Node table exported to {p}")
 
     # ---------------- checked rows / whole nodes ----------------
-    def checked_jobs(self) -> List:
+    def checked_jobs(self, in_range_only: bool = False) -> List:
         jobs = []
         for r in range(self.table.rowCount()):
             if self.table.item(r, C_SN).checkState() == Qt.Checked:
                 n = self.rows.get(self._key(r))
-                if n is not None:
+                if n is not None and (not in_range_only or self.in_range(n)):
                     jobs.append((n, n._station))
         return jobs
 
@@ -3915,6 +4491,7 @@ class MainWindow(QMainWindow):
                 self.table.removeRow(r)
         self.table.blockSignals(False); self.table.setSortingEnabled(True)
         self._mark_duplicates()
+        self._fill_range()
         if not quiet:
             self.log(f"{b.serial}: {reason} - removed from the table ({path})")
 
@@ -3935,20 +4512,48 @@ class MainWindow(QMainWindow):
             self.log("Unmount: no USB node volumes among those nodes (folders/archives are "
                      "left alone).")
             return
-        from PySide6.QtGui import QGuiApplication
-        QGuiApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            for b in vols:
-                self._set_status_path(b.path, "unmounting...")
-                QApplication.processEvents()
-                ok, msg = unmount_volume(b.path)
+        if self.loaders or self._loading:
+            QMessageBox.information(self, "Unmount", "DumbSolo is still reading nodes; try "
+                                    "again when loading has finished."); return
+        # DumbSolo itself must not touch the drives while they are being removed
+        self.presence_timer.stop()
+        auto = self.auto_timer.isActive()
+        self.auto_timer.stop()
+        paths = [b.path for b in vols]
+        serial = {b.path: b.serial for b in vols}
+        for pth in paths:
+            self._set_status_path(pth, "unmounting...")
+        self.log(f"Unmounting {len(paths)} node(s)...")
+
+        def job(progress, cancelled, log):
+            out = []
+            for pth in paths:
+                if cancelled():
+                    break
+                ok, msg = unmount_volume(pth)
+                out.append((pth, ok, msg))
+                progress(1024)
+            return out
+
+        def done(results):
+            failed = 0
+            for pth, ok, msg in results:
                 if ok:
-                    self._remove_base(b.path, "unmounted - safe to remove")
+                    self._remove_base(pth, msg)
                 else:
-                    self._set_status_path(b.path, "unmount failed")
-                    self.log(f"{b.serial}: could not unmount {b.path}: {msg}")
-        finally:
-            QGuiApplication.restoreOverrideCursor()
+                    failed += 1
+                    self._set_status_path(pth, "unmount failed")
+                    self.log(f"{serial[pth]}: could not unmount {pth}: {msg}")
+            for pth in paths[len(results):]:
+                self._set_status_path(pth, "ready")
+            self.log(f"Unmount: {len(results) - failed} done, {failed} failed"
+                     + (" - see the reasons above" if failed else ""))
+
+        def restart_timers():
+            self.presence_timer.start()
+            if auto:
+                self.auto_timer.start()
+        self._run_task(job, len(paths) * 1024, "Unmount", done, restart_timers)
 
     # ---------------- program ----------------
     def program_nodes(self):
@@ -4114,7 +4719,7 @@ class MainWindow(QMainWindow):
                 self.table.item(r, C_SN).setCheckState(Qt.Unchecked)
 
     # ---------------- raw archives ----------------
-    def _run_task(self, fn, total, label, on_done):
+    def _run_task(self, fn, total, label, on_done, on_finally=None):
         self.pbar.setRange(0, max(1, total // 1024)); self.pbar.setValue(0)
         self.worker = TaskWorker(fn)
         self.worker.progress.connect(lambda b: self.pbar.setValue(min(b, total) // 1024))
@@ -4129,6 +4734,8 @@ class MainWindow(QMainWindow):
             else:
                 self.pbar.setValue(self.pbar.maximum())
                 on_done(r)
+            if on_finally:
+                on_finally()
         self.worker.done.connect(finished)
         self.btn_go.setEnabled(False); self.btn_cancel.setEnabled(True)
         self.worker.start()
@@ -4146,17 +4753,21 @@ class MainWindow(QMainWindow):
                                     "folder first (archives are extracted under it)."); return
         total = sum(archive_total_bytes(f) for f in files)
         self.log(f"Loading {len(files)} archive(s) into {dest}")
+        workers = max(1, min(self.sp_workers.value(), 4))
 
         def job(progress, cancelled, log):
-            out = []
-            for f in files:
-                d = extract_archive(f, dest, progress, cancelled, log)
-                out.append((f, d))
-            return out
+            res = extract_archives(files, dest, progress, cancelled, log, workers)
+            src = {}
+            for f, d in res:                 # find the nodes here, off the GUI thread
+                for p in find_node_dirs(d, max_depth=3):
+                    src[os.path.abspath(p)] = f
+            return len(res), src
 
-        def done(results):
-            for f, d in results:
-                self.load_paths(find_node_dirs(d, max_depth=3), archive_src=f)
+        def done(r):
+            n_ok, src = r
+            self.log(f"Load archive: {n_ok} of {len(files)} archive(s) extracted, "
+                     f"{len(src)} node(s) to read")
+            self.load_paths(list(src), archive_src=src)
         self._run_task(job, total, "Load archive", done)
 
     # ---------------- run ----------------
@@ -4164,9 +4775,13 @@ class MainWindow(QMainWindow):
         if self._busy():
             return
         self.check_present()                    # drop nodes that were unplugged
-        jobs = self.checked_jobs()
+        jobs = self.checked_jobs(in_range_only=True)
+        for n, _ in self.checked_jobs():
+            if not self.in_range(n):
+                self.log(f"{n.job_tag}: no data in the time range - skipped")
         if not jobs:
-            QMessageBox.information(self, "Nothing to do", "No nodes checked."); return
+            QMessageBox.information(self, "Nothing to do",
+                                    "No ticked deployments with data in the time range."); return
         root = self.ed_sds.text().strip()
         do_harvest = self.chk_sds.isChecked()
         xml = self.xml_path() if self.chk_xml.isChecked() else ""
@@ -4179,12 +4794,39 @@ class MainWindow(QMainWindow):
             if not self.raw_dir():
                 QMessageBox.information(self, "Archive", "Set the raw data folder (or open a "
                                         "project), or untick 'Archive raw node data'."); return
-            archive = [b for b in self.checked_bases()
-                       if getattr(b, "_volume", False) and not getattr(b, "_archive", "")
-                       and not os.path.exists(archive_path(b, self.raw_dir()))]
-            for b in self.checked_bases():
-                if not getattr(b, "_volume", False) and not getattr(b, "_archive", ""):
-                    self.log(f"{b.serial}: loaded from a folder, not a USB volume - not archived")
+            # per node: the ticked deployments, clipped to the time range
+            sel: Dict[str, list] = {}
+            bases: Dict[str, Node] = {}
+            uncut: Dict[str, set] = {}           # deployments selected in full
+            for n, _ in jobs:
+                es = effective_settings(n, self.settings())
+                n_end = (n.end + dt.timedelta(seconds=1.0 / (n.sample_rate or 1.0))
+                         if n.end else None)
+                a = es.t_start or n.start
+                b = es.t_end or n_end
+                if a is not None and b is not None and a < b:
+                    sel.setdefault(n.whole.path, []).append((a, b))
+                    bases[n.whole.path] = n.whole
+                    if a <= n.start and b >= n_end:
+                        uncut.setdefault(n.whole.path, set()).add(n.key)
+            for path, b in bases.items():
+                if getattr(b, "_archive", "") or not getattr(b, "_volume", False):
+                    if not getattr(b, "_archive", ""):
+                        self.log(f"{b.serial}: loaded from a folder, not a USB volume "
+                                 f"- not archived")
+                    continue
+                iv = sel[path]
+                # every deployment of the node selected in full -> full archive
+                # (the gaps between deployments hold no data)
+                all_segs = {k for k in self.rows if k.startswith(path + "#")}
+                full = (bool(all_segs) and all_segs <= uncut.get(path, set())) \
+                    or covers_whole_node(b, iv)
+                dest = archive_path(b, self.raw_dir()) if full else os.path.join(
+                    self.raw_dir(), partial_archive_name(b, _merge_intervals(iv)))
+                if os.path.exists(dest):
+                    self.log(f"{b.serial}: already archived ({os.path.basename(dest)})")
+                    continue
+                archive.append((b, None if full else iv))
         t0, t1 = self.window()
         if do_harvest and not root:
             QMessageBox.information(self, "SDS", "Choose an SDS root folder."); return
@@ -4194,7 +4836,12 @@ class MainWindow(QMainWindow):
                                     "(or the checked nodes are already archived)."); return
         if xml and xml_all and not root:
             QMessageBox.information(self, "StationXML", "'All deployments' needs the SDS folder (harvest DB)."); return
-        if do_harvest and t0 and t1 and t1 <= t0:
+        if not self.range_valid():
+            QMessageBox.warning(self, "Time range",
+                                "The time range can't be read. Use YYYY-MM-DD, "
+                                "YYYY-MM-DD HH:MM or YYYY-MM-DD HH:MM:SS (UTC), "
+                                "or leave it empty."); return
+        if t0 and t1 and t1 <= t0:
             QMessageBox.warning(self, "Time range", "'To' must be after 'From'."); return
         tags = [n.job_tag for n, _ in jobs]
         twice = sorted({t for t in tags if tags.count(t) > 1})
@@ -4234,8 +4881,7 @@ class MainWindow(QMainWindow):
         self._job_bytes = {}          # job id -> bytes done
         self._tag_total = {n.job_tag: n.data_bytes for n, _ in jobs}
         self._tag_key = {n.job_tag: n.key for n, _ in jobs}
-        self._archive_total = sum(sum(os.path.getsize(p) for p in _archive_files(b.path))
-                                  for b in archive)
+        self._archive_total = sum(self._archive_estimate(b, iv) for b, iv in archive)
         self._archive_done = 0
         total = (sum(self._tag_total.values()) if do_harvest else 0) + self._archive_total
         self.pbar.setRange(0, max(1, total // 1024)); self.pbar.setValue(0)
@@ -4249,12 +4895,31 @@ class MainWindow(QMainWindow):
         for n, _ in jobs:
             self._set_status(n.key, "queued")
         self.log(transform_description())
-        if t0 and t1:
-            self.log(f"Time range: {t0} to {t1} (UTC, end exclusive)")
+        if t0 or t1:
+            self.log(f"Time range: {t0 or 'start'} to {t1 or 'end'} (UTC, end exclusive)")
         rot = [f"{n.job_tag}:{n.rotation:g} deg" for n, _ in jobs if n.rotation]
         if rot:
             self.log("Applying rotation to N/E (clockwise +): " + ", ".join(rot))
         self.worker.start()
+
+    @staticmethod
+    def _archive_estimate(b, intervals) -> int:
+        """Bytes an archive will hold (data pro rata in time), for the progress bar."""
+        files = _archive_files(b.path)
+        if intervals is None:
+            return sum(os.path.getsize(p) for p in files)
+        data = {os.path.normcase(os.path.abspath(f.path)): f for f in b.files}
+        tot = 0
+        for p in files:
+            f = data.get(os.path.normcase(os.path.abspath(p)))
+            if f is None:
+                tot += os.path.getsize(p)
+            elif f.first_time and f.last_time:
+                span = max(1.0, (f.last_time - f.first_time).total_seconds())
+                ov = sum(max(0.0, (min(f.last_time, bb) - max(f.first_time, aa)).total_seconds())
+                         for aa, bb in intervals)
+                tot += int(f.size * min(1.0, ov / span))
+        return tot
 
     def _on_event(self, e):
         kind = e[0]

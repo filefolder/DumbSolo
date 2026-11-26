@@ -1,4 +1,4 @@
-# DumbSolo v0.1.0
+# DumbSolo v0.2
 
 DumbSolo is a single-file, cross-platform (Win,OSX,Linux) desktop GUI utility for collecting data
 from DigiS0lo-style seismic nodes (IGU-16HR 3C, IGU-16 1C and BD3C-5 types).
@@ -25,6 +25,19 @@ Most of this code and README is originally AI (sorry!!) but we have tested it fa
 It should be working more or less as expected, but bug reports and PRs gladly received.
 
 ![image](https://github.com/filefolder/DumbSolo/blob/main/dumbsolo_screenshot.png)
+
+---
+## CHANGELOG
+
+v0.2 / 26 Nov 2026
+* fix issue where drives may not always unmount (windows)
+* fix bug where sites split within same node may be sampling incorrect GPS coordinates
+* fix issue where backup archives save data outside of given time range selection
+* add "hide deployments outside range" toggle & grey-out slices outside of range
+* make loading many archives at once behave a bit nicer
+
+v0.1 / 22 Oct 2026
+* initial release
 
 ---
 
